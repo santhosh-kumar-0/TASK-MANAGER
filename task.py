@@ -3,6 +3,8 @@ import json
 import os
 import hashlib # For password hashing
 from datetime import datetime, timedelta
+import threading
+import speech_recognition as sr
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -10,7 +12,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QLabel, QDateTimeEdit, QMessageBox,
     QStackedWidget, QComboBox, QFrame, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QDateTime, QTimer, QSize
+from PyQt5.QtCore import Qt, QDateTime, QTimer, QSize, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon
 
 # Imports for email notification (standard Python libraries)
@@ -36,6 +38,34 @@ except ImportError:
     PLYER_AVAILABLE = False
     print("Plyer library not found. Native desktop notifications will not be available. Please install it using 'pip install plyer'.")
 
+# --- Voice Recognition Thread ---
+class VoiceRecognitionThread(QWidget):
+    recognized_text = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.recognizer = sr.Recognizer()
+        self.microphone = sr.Microphone()
+        self.is_listening = False
+
+    def listen(self):
+        self.is_listening = True
+        try:
+            with self.microphone as source:
+                self.recognizer.adjust_for_ambient_noise(source)
+                audio = self.recognizer.listen(source, timeout=5)
+            
+            try:
+                text = self.recognizer.recognize_google(audio)
+                self.recognized_text.emit(text)
+            except sr.UnknownValueError:
+                self.recognized_text.emit("Could not understand audio")
+            except sr.RequestError as e:
+                self.recognized_text.emit(f"Could not request results; {e}")
+        except Exception as e:
+            self.recognized_text.emit(f"Error: {str(e)}")
+        finally:
+            self.is_listening = False
 
 # --- Task Data Model ---
 class Task:
@@ -117,6 +147,7 @@ class CustomMessageBox(QMessageBox):
                 background-color: #5d8edb;
             }
         """)
+
 
 # --- Login Window ---
 class LoginWindow(QWidget):
@@ -286,6 +317,7 @@ class LoginWindow(QWidget):
         self.main_app_stacked_widget.setCurrentIndex(1) # Show SignUpWindow
         self.username_input.clear()
         self.password_input.clear()
+
 
 # --- Sign Up Window ---
 class SignUpWindow(QWidget):
@@ -483,34 +515,101 @@ class SignUpWindow(QWidget):
 
 # --- Main Task Manager UI (Encapsulated) ---
 class MainTaskManagerUI(QWidget):
-    """
-    This class contains the actual UI and logic for the task manager.
-    It is now a child widget managed by the main TaskManagerApp (QStackedWidget).
-    """
     def __init__(self):
         super().__init__()
         self.tasks = []
-        self.current_user = None # To hold the logged-in username
-        self.data_file_prefix = "_tasks.json" # Tasks file will be like "username_tasks.json"
+        self.current_user = None
+        self.data_file_prefix = "_tasks.json"
         
         self.init_ui()
         self.apply_stylesheet()
-        self.setup_reminder_timer() # Setup timer for time-based reminders
+        self.setup_reminder_timer()
+        
+        # Initialize voice recognition if available
+        try:
+            self.init_voice_recognition()
+            self.voice_enabled = True
+        except Exception as e:
+            print(f"Voice recognition not available: {e}")
+            self.voice_enabled = False
 
-        # --- IMPORTANT: Configure your email and Twilio credentials here ---
-        # For email: You'll need a Gmail account and an App Password (not your main password).
-        # See Google Account Security -> 2-Step Verification -> App passwords.
-        self.SENDER_EMAIL = "santhoshradha360@gmail.com"  # <--- REPLACE WITH YOUR GMAIL ADDRESS
-        self.SENDER_EMAIL_PASSWORD = "your_app_password" # <--- REPLACE WITH YOUR GENERATED APP PASSWORD
+        # Email and SMS config remains the same
+        self.SENDER_EMAIL = "your_email@gmail.com"
+        self.SENDER_EMAIL_PASSWORD = "your_app_password"
+        self.TWILIO_ACCOUNT_SID = "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        self.TWILIO_AUTH_TOKEN = "your_auth_token"
+        self.TWILIO_PHONE_NUMBER = "+1234567890"
 
-        # For Twilio SMS: Sign up at twilio.com, get a phone number, then find your Account SID and Auth Token.
-        # Install the library: pip install twilio
-        self.TWILIO_ACCOUNT_SID = "AC0b23229c56eacd63f5f3232220af1271" # <--- REPLACE WITH YOUR TWILIO ACCOUNT SID
-        self.TWILIO_AUTH_TOKEN = "92b977ca7be8741eaf023d651cf14a46"       # <--- REPLACE WITH YOUR TWILIO AUTH TOKEN
-        self.TWILIO_PHONE_NUMBER = "+916374635898"         # <--- REPLACE WITH YOUR TWILIO PHONE NUMBER (e.g., +15017122661)
+    def init_voice_recognition(self):
+        """Initialize voice recognition components."""
+        self.voice_thread = VoiceRecognitionThread()
+        self.voice_thread.recognized_text.connect(self.process_voice_command)
+        
+        # Add voice button to the UI
+        self.voice_button = QPushButton("🎤")
+        self.voice_button.setIcon(QIcon.fromTheme("microphone"))
+        self.voice_button.setToolTip("Voice Command (Experimental)")
+        self.voice_button.setObjectName("voiceButton")
+        self.voice_button.clicked.connect(self.toggle_voice_recognition)
+        
+        # Add the voice button to your existing button layout
+        self.button_layout.addWidget(self.voice_button)
 
-        self.check_external_service_configs() # Check if credentials are placeholders
+    def toggle_voice_recognition(self):
+        """Start or stop voice recognition."""
+        if not self.voice_enabled:
+            self.show_message_box("Voice Not Available", 
+                                "Voice recognition is not available on this system.", 
+                                QMessageBox.Warning)
+            return
+            
+        if self.voice_thread and self.voice_thread.is_listening:
+            return
+            
+        threading.Thread(target=self.voice_thread.listen, daemon=True).start()
+        self.show_message_box("Listening", "Speak your command now...", QMessageBox.Information)
 
+    def process_voice_command(self, command):
+        """Process the recognized voice command."""
+        command = command.lower().strip()
+        print(f"Voice command recognized: {command}")
+        
+        if not command or "could not" in command or "error" in command.lower():
+            self.show_message_box("Voice Error", 
+                               f"Could not process voice command: {command}", 
+                               QMessageBox.Warning)
+            return
+            
+        # Basic voice commands mapping
+        commands = {
+            'add task': lambda: self.task_name_input.setFocus(),
+            'complete': self.mark_task_complete,
+            'delete': self.delete_task,
+            'update': self.update_selected_task,
+            'clear': self.clear_fields,
+            'show tasks': self.refresh_task_list,
+            'exit': self.close
+        }
+        
+        # Check for specific commands
+        for cmd, action in commands.items():
+            if cmd in command:
+                action()
+                return
+                
+        # Handle "add [task name]" pattern
+        if command.startswith("add "):
+            task_name = command[4:].strip()
+            self.task_name_input.setText(task_name)
+            self.task_name_input.setFocus()
+        else:
+            self.show_message_box("Voice Command", 
+                               f"Command not recognized: {command}\n\n"
+                               "Available commands:\n"
+                               "- Add task\n- Complete\n- Delete\n- Update\n"
+                               "- Clear\n- Show tasks\n- Exit", 
+                               QMessageBox.Information)
+            
     def check_external_service_configs(self):
         """Checks if external service credentials are still default placeholders and warns the user."""
         warnings = []
@@ -831,6 +930,25 @@ class MainTaskManagerUI(QWidget):
             }
             QPushButton#actionButton:pressed {
                 background-color: #444444;
+            }
+
+            /* Voice Button */
+            QPushButton#voiceButton {
+                background-color: #6a9de3;
+                border: none;
+                border-radius: 8px;
+                padding: 8px;
+                min-width: 36px;
+                min-height: 36px;
+            }
+            QPushButton#voiceButton:hover {
+                background-color: #7ab0ff;
+            }
+            QPushButton#voiceButton:pressed {
+                background-color: #5d8edb;
+            }
+            QPushButton#voiceButton:disabled {
+                background-color: #555555;
             }
 
 
